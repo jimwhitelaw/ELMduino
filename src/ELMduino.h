@@ -329,6 +329,7 @@ public:
 	int8_t get_vin_blocking(char vin[]);
 	bool resetDTC();
 	void currentDTCCodes(const bool& isBlocking = true);
+	bool isPidSupported(uint8_t pid);
 
 	uint32_t supportedPIDs_1_20();
 

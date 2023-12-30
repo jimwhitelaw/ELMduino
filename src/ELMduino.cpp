@@ -2788,3 +2788,44 @@ void ELM327::currentDTCCodes(const bool &isBlocking)
         }
     }
 }
+
+bool ELM327::isPidSupported(uint8_t pid)
+{
+    if (nb_query_state == SEND_COMMAND)
+    {
+        processPID(SERVICE_01, SUPPORTED_PIDS_1_20, 1, 4);      
+        nb_query_state = WAITING_RESP;
+    }
+
+    else if (nb_query_state == WAITING_RESP)
+    {
+        get_response();
+    }
+    
+    if (nb_rx_state == ELM_SUCCESS)
+    {
+        nb_query_state = SEND_COMMAND; // Reset the query state machine for next command
+     
+        uint32_t supportedPids = (uint32_t)findResponse();
+        if ((supportedPids>>(32-pid)) & 0x1)
+        {
+            return true;
+        }
+        else
+        {
+            return false; 
+        }
+    }
+
+    else if (nb_rx_state != ELM_GETTING_MSG)
+    {
+        nb_query_state = SEND_COMMAND; // Error or timeout, so reset the query state machine for next command
+
+        if (debugMode)
+        {
+            Serial.println("ELMduino: Checking supported PID failed.");
+            printError();
+        }
+    }   
+    return false;
+}
