@@ -29,7 +29,7 @@ void setup()
 
     if (!myELM327.begin(ELM_PORT, true, 2000))
     {
-        Serial.println("Couldn't connect to OBD scanner - Phase 2");
+        DEBUG_PORT.println("Couldn't connect to OBD scanner - Phase 2");
         while (1)
             ;
     }
@@ -39,7 +39,7 @@ void setup()
 
 void loop()
 {
-    uint8_t pid = FUEL_PRESSURE;
+    uint8_t pid = ENGINE_RPM;
     bool pidOK = myELM327.isPidSupported(pid);
     if (myELM327.nb_rx_state == ELM_SUCCESS)
     {
