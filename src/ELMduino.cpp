@@ -111,18 +111,25 @@ bool ELM327::initializeELM(const char &protocol, const byte &dataTimeout)
         sprintf(command, SET_PROTOCOL_TO_AUTO_H_SAVE, protocol);
         if (sendCommand_Blocking(command) == ELM_SUCCESS)
         {
-            if (strstr(payload, "OK") != NULL)
+            if (strstr(payload, RESPONSE_OK) != NULL)
             {
                 // Protocol search can take a comparatively long time. Temporarily set
                 // the timeout value to 30 seconds, then restore the previous value.
                 uint16_t prevTimeout = timeout_ms;
                 timeout_ms = 30000;
 
-                if (sendCommand_Blocking("0100") == ELM_SUCCESS)
+                int8_t state = sendCommand_Blocking("0100");
+
+                if (state == ELM_SUCCESS)
                 {
                     timeout_ms = prevTimeout;
                     connected = true;
                     return connected;
+                }
+                else if (state == ELM_BUFFER_OVERFLOW)
+                {
+                    while (elm_port->available())
+                        elm_port->read();
                 }
 
                 timeout_ms = prevTimeout;
@@ -136,7 +143,7 @@ bool ELM327::initializeELM(const char &protocol, const byte &dataTimeout)
 
         if (sendCommand_Blocking(command) == ELM_SUCCESS)
         {
-            if (strstr(payload, "OK") != NULL)
+            if (strstr(payload, RESPONSE_OK) != NULL)
             {
                 connected = true;
                 return connected;
@@ -156,9 +163,14 @@ bool ELM327::initializeELM(const char &protocol, const byte &dataTimeout)
     sprintf(command, SET_PROTOCOL_TO_H_SAVE, protocol);
 
     if (sendCommand_Blocking(command) == ELM_SUCCESS)
-        if (strstr(payload, "OK") != NULL)
+    {
+        if (strstr(payload, RESPONSE_OK) != NULL)
+        {
             connected = true;
-
+            return connected;
+        }
+    }
+    
     if (debugMode)
     {
         Serial.print(F("Setting protocol via "));
@@ -196,6 +208,8 @@ void ELM327::formatQueryArray(uint8_t service, uint16_t pid, uint8_t num_respons
         Serial.println(pid);
     }
 
+    isMode0x22Query = (service == 0x22 && pid <= 0xFF); // mode 0x22 responses always zero-pad the pid to 4 chars, even for a 2-char pid
+
     query[0] = ((service >> 4) & 0xF) + '0';
     query[1] = (service & 0xF) + '0';
 
@@ -208,15 +222,15 @@ void ELM327::formatQueryArray(uint8_t service, uint16_t pid, uint8_t num_respons
 
         longQuery = true;
 
-        query[2] = ((pid >> 12)  & 0xF) + '0';
-        query[3] = ((pid >> 8)   & 0xF) + '0';
-        query[4] = ((pid >> 4)   & 0xF) + '0';
-        query[5] =  (pid         & 0xF) + '0';
+        query[2] = ((pid >> 12) & 0xF) + '0';
+        query[3] = ((pid >> 8) & 0xF) + '0';
+        query[4] = ((pid >> 4) & 0xF) + '0';
+        query[5] = (pid & 0xF) + '0';
 
         if (num_responses > 0xF)
         {
             query[6] = ((num_responses >> 4) & 0xF) + '0';
-            query[7] = ( num_responses       & 0xF) + '0';
+            query[7] = (num_responses & 0xF) + '0';
             query[8] = '\0';
 
             upper(query, 8);
@@ -238,12 +252,12 @@ void ELM327::formatQueryArray(uint8_t service, uint16_t pid, uint8_t num_respons
         longQuery = false;
 
         query[2] = ((pid >> 4) & 0xF) + '0';
-        query[3] =  (pid       & 0xF) + '0';
+        query[3] = (pid & 0xF) + '0';
 
         if (num_responses > 0xF)
         {
             query[4] = ((num_responses >> 4) & 0xF) + '0';
-            query[5] = ( num_responses       & 0xF) + '0';
+            query[5] = (num_responses & 0xF) + '0';
             query[6] = '\0';
             query[7] = '\0';
             query[8] = '\0';
@@ -393,7 +407,7 @@ int8_t ELM327::nextIndex(char const *str,
 }
 
 /*
- void ELM327::conditionResponse(const uint8_t &numExpectedBytes, const float &scaleFactor, const float &bias)
+ double ELM327::conditionResponse(const uint8_t &numExpectedBytes, const float &scaleFactor, const float &bias)
 
  Description:
  ------------
@@ -408,9 +422,9 @@ int8_t ELM327::nextIndex(char const *str,
 
  Return:
  -------
-  * float - Converted numerical value
+  * double - Converted numerical value
 */
-float ELM327::conditionResponse(const uint8_t &numExpectedBytes, const float &scaleFactor, const float &bias)
+double ELM327::conditionResponse(const uint8_t &numExpectedBytes, const double &scaleFactor, const float &bias)
 {
     uint8_t numExpectedPayChars = numExpectedBytes * 2;
     uint8_t payCharDiff = numPayChars - numExpectedPayChars;
@@ -438,7 +452,16 @@ float ELM327::conditionResponse(const uint8_t &numExpectedBytes, const float &sc
         return 0;
     }
     else if (numExpectedPayChars == numPayChars)
-        return (response * scaleFactor) + bias;
+    {
+        if (scaleFactor == 1 && bias == 0) // No scale/bias needed
+        {
+            return response;
+        }
+        else
+        {
+            return (response * scaleFactor) + bias;
+        }
+    }
 
     // If there were more payload bytes returned than we expected, test the first and last bytes in the
     // returned payload and see which gives us a higher value. Sometimes ELM327's return leading zeros
@@ -447,7 +470,7 @@ float ELM327::conditionResponse(const uint8_t &numExpectedBytes, const float &sc
     // will not give accurate results!
 
     if (debugMode)
-        Serial.println("Looking for lagging zeros");
+        Serial.println(F("Looking for lagging zeros"));
 
     uint16_t numExpectedBits = numExpectedBytes * 8;
     uint64_t laggingZerosMask = 0;
@@ -458,16 +481,30 @@ float ELM327::conditionResponse(const uint8_t &numExpectedBytes, const float &sc
     if (!(laggingZerosMask & response)) // Detect all lagging zeros in `response`
     {
         if (debugMode)
-            Serial.println("Lagging zeros found");
+            Serial.println(F("Lagging zeros found"));
 
-        return ((float)(response >> (4 * payCharDiff)) * scaleFactor) + bias;
+        if (scaleFactor == 1 && bias == 0) // No scale/bias needed
+        {
+            return (response >> (4 * payCharDiff));
+        }
+        else
+        {
+            return ((response >> (4 * payCharDiff)) * scaleFactor) + bias;
+        }
     }
     else
     {
         if (debugMode)
-            Serial.println("Lagging zeros not found - assuming leading zeros");
+            Serial.println(F("Lagging zeros not found - assuming leading zeros"));
 
-        return (response * scaleFactor) + bias;
+        if (scaleFactor == 1 && bias == 0) // No scale/bias needed
+        {
+            return response;
+        }
+        else
+        {
+            return (response * scaleFactor) + bias;
+        }
     }
 }
 
@@ -551,7 +588,7 @@ bool ELM327::queryPID(char queryStr[])
 }
 
 /*
- float ELM327::processPID(const uint8_t& service, const uint16_t& pid, const uint8_t& num_responses, const uint8_t& numExpectedBytes, const float& scaleFactor, const float& bias)
+ double ELM327::processPID(const uint8_t& service, const uint16_t& pid, const uint8_t& num_responses, const uint8_t& numExpectedBytes, const float& scaleFactor, const float& bias)
 
  Description:
  ------------
@@ -573,7 +610,7 @@ bool ELM327::queryPID(char queryStr[])
  -------
   * float - The PID value if successfully received, else 0.0
 */
-float ELM327::processPID(const uint8_t &service, const uint16_t &pid, const uint8_t &num_responses, const uint8_t &numExpectedBytes, const float &scaleFactor, const float &bias)
+double ELM327::processPID(const uint8_t &service, const uint16_t &pid, const uint8_t &num_responses, const uint8_t &numExpectedBytes, const double &scaleFactor, const float &bias)
 {
     if (nb_query_state == SEND_COMMAND)
     {
@@ -587,7 +624,7 @@ float ELM327::processPID(const uint8_t &service, const uint16_t &pid, const uint
         {
             nb_query_state = SEND_COMMAND; // Reset the query state machine for next command
 
-            findResponse();
+            findResponse(service, pid);
 
             return conditionResponse(numExpectedBytes, scaleFactor, bias);
         }
@@ -2175,7 +2212,7 @@ int8_t ELM327::get_response(void)
                 Serial.println(F("\\v"));
             // convert spaces to underscore, easier to see in debug output
             else if (recChar == ' ')
-                Serial.println("_");
+                Serial.println(F("_"));
             // display regular printable
             else
                 Serial.println(recChar);
@@ -2240,7 +2277,7 @@ int8_t ELM327::get_response(void)
     }
 
     // Now we have successfully received OBD response, check if the payload indicates any OBD errors
-    if (nextIndex(payload, "UNABLETOCONNECT") >= 0)
+    if (nextIndex(payload, RESPONSE_UNABLE_TO_CONNECT) >= 0)
     {
         if (debugMode)
             Serial.println(F("ELM responded with error \"UNABLE TO CONNECT\""));
@@ -2251,7 +2288,7 @@ int8_t ELM327::get_response(void)
 
     connected = true;
 
-    if (nextIndex(payload, "NODATA") >= 0)
+    if (nextIndex(payload, RESPONSE_NO_DATA) >= 0)
     {
         if (debugMode)
             Serial.println(F("ELM responded with error \"NO DATA\""));
@@ -2260,7 +2297,7 @@ int8_t ELM327::get_response(void)
         return nb_rx_state;
     }
 
-    if (nextIndex(payload, "STOPPED") >= 0)
+    if (nextIndex(payload, RESPONSE_STOPPED) >= 0)
     {
         if (debugMode)
             Serial.println(F("ELM responded with error \"STOPPED\""));
@@ -2269,7 +2306,7 @@ int8_t ELM327::get_response(void)
         return nb_rx_state;
     }
 
-    if (nextIndex(payload, "ERROR") >= 0)
+    if (nextIndex(payload, RESPONSE_ERROR) >= 0)
     {
         if (debugMode)
             Serial.println(F("ELM responded with \"ERROR\""));
@@ -2283,7 +2320,7 @@ int8_t ELM327::get_response(void)
 }
 
 /*
- uint64_t ELM327::findResponse()
+ uint64_t ELM327::findResponse(uint8_t &service)
 
  Description:
  ------------
@@ -2297,7 +2334,7 @@ int8_t ELM327::get_response(void)
  -------
   * uint64_t - Query response value
 */
-uint64_t ELM327::findResponse()
+uint64_t ELM327::findResponse(const uint8_t &service, const uint8_t &pid)
 {
     uint8_t firstDatum = 0;
     char header[7] = {'\0'};
@@ -2315,8 +2352,18 @@ uint64_t ELM327::findResponse()
     {
         header[0] = query[0] + 4;
         header[1] = query[1];
-        header[2] = query[2];
-        header[3] = query[3];
+        if (isMode0x22Query) // mode 0x22 responses always zero-pad the pid to 4 chars, even for a 2-char pid
+        {
+            header[2] = '0';
+            header[3] = '0';
+            header[4] = query[2];
+            header[5] = query[3];
+        }
+        else
+        {
+            header[2] = query[2];
+            header[3] = query[3];
+        }
     }
 
     if (debugMode)
@@ -2330,7 +2377,7 @@ uint64_t ELM327::findResponse()
 
     if (firstHeadIndex >= 0)
     {
-        if (longQuery)
+        if (longQuery | isMode0x22Query)
             firstDatum = firstHeadIndex + 6;
         else
             firstDatum = firstHeadIndex + 4;
@@ -2450,7 +2497,7 @@ void ELM327::printError()
 }
 
 /*
- float ELM327::batteryVoltage(void)
+ float ELM327::batteryVoltage()
 
  Description:
  ------------
@@ -2462,9 +2509,9 @@ void ELM327::printError()
 
  Return:
  -------
-  * flaot - vehicle battery voltage in VDC
+  * float - vehicle battery voltage in VDC
 */
-float ELM327::batteryVoltage(void)
+float ELM327::batteryVoltage()
 {
     if (nb_query_state == SEND_COMMAND)
     {
@@ -2476,9 +2523,16 @@ float ELM327::batteryVoltage(void)
         get_response();
         if (nb_rx_state == ELM_SUCCESS)
         {
-            nb_query_state = SEND_COMMAND;       // Reset the query state machine for next command
-            payload[strlen(payload) - 1] = '\0'; // remove the last char ("V") from the payload value
-            return (float)strtod(payload, NULL);
+            nb_query_state = SEND_COMMAND;         // Reset the query state machine for next command
+            payload[strlen(payload) - 1] = '\0';   // Remove the last char ("V") from the payload value
+            if (strncmp(payload, "ATRV", 4) == 0)
+            {
+                return (float)strtod(payload + 4, NULL);
+            }
+            else 
+            {
+                return (float)strtod(payload, NULL);
+            }
         }
         else if (nb_rx_state != ELM_GETTING_MSG)
             nb_query_state = SEND_COMMAND; // Error or timeout, so reset the query state machine for next command
@@ -2510,7 +2564,8 @@ int8_t ELM327::get_vin_blocking(char vin[])
     uint8_t ascii_val;
 
     if (debugMode)
-        Serial.println("Getting VIN...");
+        Serial.println(F("Getting VIN..."));
+
     sendCommand("0902"); // VIN is command 0902
     while (get_response() == ELM_GETTING_MSG)
         ;
@@ -2546,7 +2601,7 @@ int8_t ELM327::get_vin_blocking(char vin[])
         }
         if (debugMode)
         {
-            Serial.print("VIN: ");
+            Serial.print(F("VIN: "));
             Serial.println(vin);
         }
     }
@@ -2554,7 +2609,7 @@ int8_t ELM327::get_vin_blocking(char vin[])
     {
         if (debugMode)
         {
-            Serial.println("No VIN response");
+            Serial.println(F("No VIN response"));
             printError();
         }
     }
@@ -2587,7 +2642,7 @@ bool ELM327::resetDTC()
         {
             if (debugMode)
             {
-                Serial.println("ELMduino: DTC successfully reset.");
+                Serial.println(F("ELMduino: DTC successfully reset."));
             }
 
             return true;
@@ -2597,7 +2652,7 @@ bool ELM327::resetDTC()
     {
         if (debugMode)
         {
-            Serial.println("ELMduino: Resetting DTC codes failed.");
+            Serial.println(F("ELMduino: Resetting DTC codes failed."));
         }
     }
 
@@ -2665,15 +2720,15 @@ void ELM327::currentDTCCodes(const bool &isBlocking)
             // Each response line will start with "43" indicating it is a response to a Mode 03 request.
             // See p. 31 of ELM327 datasheet for details and lookup table of code types.
 
-            uint codesFound = strlen(payload) / 8; // Each code found returns 8 chars starting with "43"
-            idx = strstr(payload, "43") + 4;       // Pointer to first DTC code digit (third char in the response)
+            uint8_t codesFound = strlen(payload) / 8; // Each code found returns 8 chars starting with "43"
+            idx = strstr(payload, "43") + 4;          // Pointer to first DTC code digit (third char in the response)
 
-            if (codesFound > DTC_MAX_CODES)        // I don't think the ELM is capable of returning
-            {                                      // more than 0xF (16) codes, but just in case...
+            if (codesFound > DTC_MAX_CODES) // I don't think the ELM is capable of returning
+            {                               // more than 0xF (16) codes, but just in case...
                 codesFound = DTC_MAX_CODES;
-                Serial.print("DTC response truncated at ");
+                Serial.print(F("DTC response truncated at "));
                 Serial.print(DTC_MAX_CODES);
-                Serial.println(" codes.");
+                Serial.println(F(" codes."));
             }
 
             DTC_Response.codesFound = codesFound;
@@ -2763,7 +2818,7 @@ void ELM327::currentDTCCodes(const bool &isBlocking)
 
                 if (debugMode)
                 {
-                    Serial.print("ELMduino: Found code: ");
+                    Serial.print(F("ELMduino: Found code: "));
                     Serial.println(temp);
                 }
             }
@@ -2772,7 +2827,7 @@ void ELM327::currentDTCCodes(const bool &isBlocking)
         {
             if (debugMode)
             {
-                Serial.println("ELMduino: DTC response received with no valid data.");
+                Serial.println(F("ELMduino: DTC response received with no valid data."));
             }
         }
         return;
@@ -2783,8 +2838,62 @@ void ELM327::currentDTCCodes(const bool &isBlocking)
 
         if (debugMode)
         {
-            Serial.println("ELMduino: Getting current DTC codes failed.");
+            Serial.println(F("ELMduino: Getting current DTC codes failed."));
             printError();
         }
     }
+}
+
+/*
+ bool ELM327::isPidSupported(uint8_t pid)
+
+ Description:
+ ------------
+  * Checks if a particular PID is supported by the connected ECU.
+
+  * This is a convenience method that selects the correct supportedPIDS_xx_xx() query and parses
+    the bit-encoded result, returning a simple Boolean value indicating PID support from the ECU.
+
+ Inputs:
+ -------
+  * uint8_t pid - the PID to check for support.
+
+ Return:
+ -------
+  * bool - Whether or not the queried PID is supported by the ECU.
+*/
+bool ELM327::isPidSupported(uint8_t pid)
+{
+    uint8_t pidInterval = (pid / PID_INTERVAL_OFFSET) * PID_INTERVAL_OFFSET;
+
+    switch (pidInterval)
+    {
+    case SUPPORTED_PIDS_1_20:
+        supportedPIDs_1_20();
+        break;
+
+    case SUPPORTED_PIDS_21_40:
+        supportedPIDs_21_40();
+        pid = (pid - SUPPORTED_PIDS_21_40);
+        break;
+
+    case SUPPORTED_PIDS_41_60:
+        supportedPIDs_41_60();
+        pid = (pid - SUPPORTED_PIDS_41_60);
+        break;
+
+    case SUPPORTED_PIDS_61_80:
+        supportedPIDs_61_80();
+        pid = (pid - SUPPORTED_PIDS_61_80);
+        break;
+
+    default:
+        break;
+    }
+
+    if (nb_rx_state == ELM_SUCCESS)
+    {
+        return ((response >> (32 - pid)) & 0x1);
+    }
+    return false;
 }
